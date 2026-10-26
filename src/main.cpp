@@ -19,6 +19,7 @@ char nodeUid[13] = {0};
 bool seatIdAssigned = false;
 
 static void saveSeatId(const char *id);
+static void applyClearSeatIdCommand(JsonDocument& doc);
 
 #define LOAD_SENSOR_PIN 34  // GPIO34 / ADC1_CH6; input-only, external FSR divider required
 #define BUTTON_PIN 27       // button to GND; GPIO27 supports INPUT_PULLUP
@@ -60,7 +61,7 @@ Preferences prefs;   // NVS storage for the seat id
 
 // Router-centric transport. All seats associate with the real router; one UDP
 // socket on the master receives the entire fleet without persistent TCP slots.
-static const char* ROUTER_SSID = "iot_bus";
+static const char* ROUTER_SSID = "iot_bus-015";
 static const char* ROUTER_PASS = "iot_BUS@5758";
 static constexpr uint16_t MASTER_UDP_PORT = 5758;
 static constexpr uint16_t SEAT_UDP_PORT = 5759;
@@ -170,18 +171,24 @@ static uint32_t nextUdpSequence() {
 }
 
 static bool sendSeatPacket(uint32_t seq, int sensorState, bool occupied,
-                           bool seatbelt) {
+                           bool seatbelt, uint16_t pressure = 0) {
   if (masterIp == IPAddress()) return false;
+  if (pressure == 0 && occupied) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    pressure = pressureReading;
+    xSemaphoreGive(dataMutex);
+  }
   char buf[352];
   snprintf(buf, sizeof(buf),
            "{\"type\":\"seat\",\"id\":\"%s\",\"uid\":\"%s\","
            "\"unassigned\":%s,\"session\":%lu,\"seq\":%lu,"
            "\"sensorState\":%d,\"seatOccupied\":%s,\"seatbelt\":%s,"
-           "\"uptime\":%lu,\"rssi\":%d}",
+           "\"pressure\":%u,\"uptime\":%lu,\"rssi\":%d}",
            seatId, nodeUid, seatIdAssigned ? "false" : "true",
            (unsigned long)udpSession, (unsigned long)seq,
            sensorState, occupied ? "true" : "false",
            seatbelt ? "true" : "false",
+           (unsigned)pressure,
            millis() / 1000UL, (int)WiFi.RSSI());
   const bool sent = sendUdpJson(masterIp, MASTER_UDP_PORT, buf);
   if (sensorState || !sent) {
@@ -300,6 +307,11 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
           occupied = seatOccupied;
           xSemaphoreGive(dataMutex);
           sendSeatEvent(0, occupied);  // register the friendly ID immediately
+        }
+      } else if (msg.indexOf("\"action\":\"clearSeatId\"") >= 0) {
+        StaticJsonDocument<128> doc;
+        if (!deserializeJson(doc, msg)) {
+          applyClearSeatIdCommand(doc);
         }
       }
       break;
@@ -704,6 +716,20 @@ static void applySeatIdCommand(JsonDocument& doc) {
   sendSeatEvent(0, occupied);
 }
 
+static void applyClearSeatIdCommand(JsonDocument& doc) {
+  const char* targetId  = doc["id"]  | "";
+  const char* targetUid = doc["uid"] | "";
+  bool match = false;
+  if (targetId[0] != '\0' && strcasecmp(targetId, seatId) == 0) match = true;
+  if (targetUid[0] != '\0' && strcasecmp(targetUid, nodeUid) == 0) match = true;
+  if (match) {
+    clearSeatId();
+    Serial.printf("[Seat] pairing cleared for '%s' (UID: %s) via app command — restarting in RandomID pairing mode...\n", seatId, nodeUid);
+    delay(200);
+    ESP.restart();
+  }
+}
+
 static void handleUdpTransport() {
   int packetSize;
   while ((packetSize = smartbusUdp.parsePacket()) > 0) {
@@ -749,6 +775,8 @@ static void handleUdpTransport() {
     } else if (strcmp(doc["action"] | "", "setSeatId") == 0) {
       masterIp = remote;
       applySeatIdCommand(doc);
+    } else if (strcmp(doc["action"] | "", "clearSeatId") == 0) {
+      applyClearSeatIdCommand(doc);
     }
   }
 
